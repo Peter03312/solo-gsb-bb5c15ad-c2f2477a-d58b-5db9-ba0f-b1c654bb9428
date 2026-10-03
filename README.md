@@ -51,6 +51,16 @@
   **共用同一修订号仲裁**；已过期窗口、非法范围与无效窗口 ID 一律拒绝且不改许可、
   队列和修订号。历史修订查询与对比按各修订号**还原当时的管制窗口及其启用/解除
   变动**，原批准事件不追改
+- **活动设备换机许可交接**：设备换机时，运营人员把一张**当前有效许可**交接给一份
+  **待审申请**：输入**原许可 ID、接替申请 ID、预期修订号与原因**，先做只读
+  **预演**（返回当前修订号、按**现行保护带宽**且**排除原许可后**的干扰对象、
+  命中管制窗口、接替申请是否在候补及其排队位置，不改状态），再**确认**。确认在
+  **共同修订仲裁**内重算：仅当原许可仍有效、接替申请仍待审、修订号未过期且无其他
+  干扰或窗口命中时**整笔生效**——**原许可撤销与接替批准占连续两个修订号**（撤销
+  在前、批准在后），接替申请若在候补**先退队**，交接后再按**现有 FIFO 规则**重裁
+  其他候补（自动获批者占后续连续修订号）。修订过期、状态变化或冲突均**不改许可、
+  队列和修订号**；响应给出交接结果及自动批准明细。既有撤销/批准语义不变；历史
+  查询与对比可按修订号**还原每个修订号的交接状态**（撤销/批准记录互相指回）
 
 ---
 
@@ -312,6 +322,83 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
   `restriction_window_released` 事件（也并入统一的 `differences` / `events`）。
   **原批准事件不追改**。
 
+### 活动设备换机：许可交接（预演 → 确认 → 候补重裁）
+
+活动设备换机时，运营人员把一张**当前有效许可**（原许可）交接给一份**待审申请**
+（接替申请）。交接是两步操作，输入统一为
+`{"original_application_id", "replacement_application_id",
+"expected_revision", "reason"}`：
+
+**第 1 步：只读预演** `POST /api/license-handovers/preview`（**不改任何状态、不占
+修订号**）。服务校验两个 ID 存在且互不相同、原许可当前**有效**（`approved` 且未
+暂停/撤销）、接替申请仍为 `pending`，然后按**当前修订快照、现行保护带宽**，在
+**排除原许可后的有效集合**上对接替申请重新裁决（原许可本就要让位，二者是否互扰
+**不影响**交接），并检查生效管制窗口。返回：
+
+- `current_revision` / `expected_revision` / `revision_matches`：确认时以
+  `current_revision` 作为 `expected_revision`；
+- `excluded_application_id` 与 `effective_application_ids`：实际参与裁决的有效集合
+  （原许可已排除）；
+- `has_conflicts` / `conflicts[]`：排除原许可后仍存在的许可干扰（结构同单笔预览，
+  附触发条件）；
+- `has_restriction_window_conflicts` / `restriction_window_conflicts[]`：命中的
+  生效管制窗口（**保护带宽不扩张窗口**）；
+- `replacement_waitlisted` / `replacement_queue_position`：接替申请是否在候补队列
+  及其 FIFO 位置；
+- `can_proceed`：修订号匹配且无任何干扰/窗口命中时为 `true`。
+
+ID 未知 → 404 `not_found`（`details.missing_application_ids`）；原许可与接替申请
+相同 → 422（明细码 `same_application`）；原许可非有效 → 409 `not_effective`；
+接替申请非待审 → 409 `replacement_not_pending`。这些状态错误在预演与确认中一致
+拒绝；而**修订号过期、许可干扰与窗口命中在预演中只在响应体里报告**（`can_proceed`
+为 `false`），不抛 409，因为预演是只读复核。
+
+**第 2 步：确认** `POST /api/license-handovers`，携带同一 `expected_revision`。
+与所有既有写操作**共用同一修订号锁**，在锁内**重新计算**（不采用预演结果）：
+仅当下列条件**全部**成立时整笔生效——
+
+1. 原许可仍为**当前有效**许可（已被撤销/暂停 → 409 `not_effective`）；
+2. 接替申请仍为 `pending`（已被手动/自动批准等 → 409
+   `replacement_not_pending`）；
+3. `expected_revision` 等于当前修订号（否则 409 `stale_revision`）；
+4. 排除原许可后，接替申请与其他有效许可**无干扰**（否则 409 `interference`，
+   `details.conflicts` 附冲突对象）；
+5. 接替申请**不命中任何生效管制窗口**（否则 409 `restriction_window`）。
+
+生效时在**同一事务**内：
+
+- **原许可撤销占修订号 n+1**（写一条普通 `revocation_events`，保留既有撤销语义与
+  原因），原许可状态变 `revoked`；
+- **接替批准占修订号 n+2**（写一条普通 `approval_events`，保存本次裁决带宽），
+  接替申请变 `approved`、`approval_revision = n+2`；两个修订号**连续**（撤销在前）；
+- 接替申请若在候补队列，**先退出队列**（与手动批准一致，之后不会被重复自动批准）；
+- 交接完成后，在同事务内按**现有 FIFO 规则重裁其他候补**：用当前保护带宽对剩余
+  候补逐项重裁（窗口命中者保留并继续后项），自动获批者占 **n+3、n+4、…** 连续
+  修订号。响应复用释放操作的字段：`auto_approved_application_ids` /
+  `auto_approvals[]`（其中 `release_revision` 为**交接撤销修订号 n+1**）、
+  `remaining_waitlist_application_ids`、`waitlist_pending[]`、`final_revision`。
+
+任何拒绝（修订过期、状态变化、干扰、窗口命中、ID 非法、自我交接）都**不改许可、
+候补队列与修订号**（整笔事务回滚，无部分生效）。响应顶层给出交接双方、
+`revocation_revision` / `approval_revision` / `final_revision`、`handover_id` 与
+`approval`（自动批准明细）。
+
+**历史还原**：每次交接另写一条不可变 `handover_events`（连接撤销与批准两个修订号，
+保存原因、裁决带宽与 `final_revision`），不复制、不追改既有事件：
+
+- `GET /api/revision/{n}` 与 `/api/revision/current` 追加 `handovers[]`；交接撤销
+  记录附 `handover_id` / `handover_replacement_application_id` /
+  `handover_approval_revision`，接替批准记录附 `handover_id` /
+  `handover_approved` / `handover_original_application_id` /
+  `handover_revocation_revision`（其 `auto_approved` 仍为 `false`）。
+- 按修订号 n+1 查询：有效集合已不含原许可、接替尚未批准；按 n+2 查询：接替许可在
+  有效集合中；后续修订号逐项还原候补自动审批。
+- `GET /api/revision/compare` 在区间内返回 `handovers[]`（类型 `license_handover`，
+  也并入统一 `differences` / `events`），`status_changes` 同时给出原许可
+  `approved → revoked` 与接替申请 `pending → approved`。
+- 普通撤销/批准记录不带任何交接字段；暂停、恢复、带宽变更、窗口、候补登记/取消的
+  既有语义完全不变（交接之外的撤销释放仍按原规则重裁候补）。
+
 ### 可用调频位置查询（不改状态）
 
 `POST /api/applications/{id}/available-ranges` 为**待审批**申请寻找可用调频位置：
@@ -336,11 +423,12 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 ### 修订号与并发模型
 
 - 初始修订号为 **0**；每次批准、**整组批准中的每项**批准、暂停、恢复、撤销、
-  **保护带宽变更**、**管制窗口的启用与解除（各一次）**或**释放时自动获批的每个
-  候补申请**都使修订号 +1，并追加一条不可变事件（暂停/恢复因修订号过期或恢复
-  互扰被拒绝时**不占**修订号；候补登记与取消也**不占**修订号；窗口预演同样
-  不占修订号）。候补自动批准与其触发释放同处一个事务：释放操作占一个修订号，
-  每个自动获批申请占其后连续的一个修订号。
+  **保护带宽变更**、**管制窗口的启用与解除（各一次）**、**换机交接的原许可撤销与
+  接替批准（各一次，连续两个修订号）**或**释放时（含交接后）自动获批的每个候补
+  申请**都使修订号 +1，并追加一条不可变事件（暂停/恢复因修订号过期或恢复
+  互扰被拒绝时**不占**修订号；候补登记与取消也**不占**修订号；窗口预演与交接
+  预演同样**不占**修订号）。交接的撤销与其后批准、候补自动批准同处一个事务：
+  撤销占一个修订号，接替批准与每个自动获批申请占其后连续的修订号。
 - `POST .../preview` 返回 `current_revision`、冲突对象及每个触发条件。
 - `POST .../approve` 必须携带 `expected_revision`。服务在 PostgreSQL
   单行修订号表上 `SELECT ... FOR UPDATE` 串行化所有批准/撤销/带宽变更事务：
@@ -378,10 +466,11 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
   对两个已存在修订号做只读复核。返回两侧保护带宽、有效/暂停许可集合、生效管制窗口
   集合及增删集合、区间内按修订号排序的 `approval` / `suspension` / `resumption` /
   `revocation` / `guard_band_change` / `restriction_window_activated` /
-  `restriction_window_released` 事件（合并字段为 `differences`；各类事件也分别在
-  `approvals`、`suspensions`、`resumptions`、`revocations`、`guard_band_changes`、
-  `restriction_window_events` 中返回）、逐次 `status_changes`，其中审批事件保留
-  `auto_approved` 与 `release_revision`。可选 `application_id` 只筛选该申请的
+  `restriction_window_released` / `license_handover` 事件（合并字段为
+  `differences`；各类事件也分别在 `approvals`、`suspensions`、`resumptions`、
+  `revocations`、`guard_band_changes`、`restriction_window_events`、`handovers`
+  中返回）、逐次 `status_changes`，其中审批事件保留 `auto_approved` 与
+  `release_revision`。可选 `application_id` 只筛选该申请的
   许可事件（保护带宽与管制窗口变更仍返回）；未知申请返回 404。该接口只读取事件表，
   不修改申请、许可、候补队列、管制窗口或修订号。
 
@@ -434,6 +523,8 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 | `POST` | `/api/restriction-windows/{id}/release` | **解除管制窗口**（窗口 ID + 预期修订号；只影响后续裁决，不审批候补） |
 | `GET` | `/api/restriction-windows` | 列出生效窗口（`include_inactive`/`status` 可含已解除） |
 | `GET` | `/api/restriction-windows/{id}` | 查询单个窗口（生效中或已解除） |
+| `POST` | `/api/license-handovers/preview` | **换机交接预演**（原许可 ID + 接替申请 ID + 预期修订号；只读：排除原许可后的干扰对象、命中窗口、候补位置与当前修订号） |
+| `POST` | `/api/license-handovers` | **确认换机交接**（共同修订仲裁内重算；撤销+批准占连续修订号，接替先退队，随后按 FIFO 重裁候补） |
 | `GET` | `/api/revision/current` | 当前修订号 + 当前带宽 + 有效集合 + 候补队列 + 生效窗口 + 全部事件 |
 | `GET` | `/api/revision/compare` | 比较两个已存在修订号的带宽、许可集合、状态与按事件顺序的差异（只读） |
 | `GET` | `/api/revision/{revision}` | 按修订号还原当时的批准/撤销记录与当时带宽 |
@@ -450,18 +541,20 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 
 | HTTP | `error.code` | 触发场景 |
 | --- | --- | --- |
-| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组列表为空或含重复 ID 时同样 422，明细码为 `duplicate_application_id`；拟定带宽非有限数（`value_not_finite`）或为负（`guard_band_negative`）；候选下界区间非有限（`value_not_finite`）或倒置（`candidate_low_min_above_max`）；管制窗口形状非法（同申请各码）或**预演/确认时已过期**（`restriction_window_expired`） |
-| 404 | `not_found` | 申请不存在（整组时 `details.missing_application_ids` 列出全部无效 ID） |
+| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组列表为空或含重复 ID 时同样 422，明细码为 `duplicate_application_id`；拟定带宽非有限数（`value_not_finite`）或为负（`guard_band_negative`）；候选下界区间非有限（`value_not_finite`）或倒置（`candidate_low_min_above_max`）；管制窗口形状非法（同申请各码）或**预演/确认时已过期**（`restriction_window_expired`）；换机交接的原许可与接替申请为同一 ID（明细码 `same_application`） |
+| 404 | `not_found` | 申请不存在（整组时 `details.missing_application_ids` 列出全部无效 ID；换机交接时同名字段列出不存在的 ID） |
 | 404 | `restriction_window_not_found` | 解除或查询一个从未存在的管制窗口 ID |
 | 404 | `revision_out_of_range` | 查询了未来修订号 |
 | 409 | `not_pending` | 批准已处理申请 / 撤销待审批申请 / 对非待审批申请查询可用位置（整组时 `details.applications` 列出每项状态） |
 | 409 | `already_revoked` | 重复撤销（整组中混入已撤销申请时同样返回，明细同 `not_pending` 结构）；对已撤销许可暂停或恢复 |
+| 409 | `not_effective` | **换机交接的原许可不是当前有效许可**（已撤销或处于暂停；`details.status` 给出当前状态；整笔不改、不占修订号） |
+| 409 | `replacement_not_pending` | **换机交接的接替申请已不是待审状态**（`details.status` 给出当前状态；整笔不改、不占修订号） |
 | 409 | `not_approved` | 对**待审批**申请暂停（只有已获批且未撤销的许可可以暂停） |
 | 409 | `already_suspended` | 对已暂停许可重复暂停（`details.suspended_at_revision` 给出暂停修订号） |
 | 409 | `not_suspended` | 对未处于暂停状态的申请执行恢复（待审批/已获批均然，`details.status` 给出当前状态） |
 | 409 | `already_waitlisted` | 把同一申请**重复登记**为候补（`details.position` 给出当前位置） |
 | 409 | `not_waitlisted` | 取消一个**不在候补队列中**的申请（`details.status` 给出当前状态）；单项查询未登记申请时同码返回 **404** |
-| 409 | `stale_revision` | 修订号过期或被并发批准/暂停/恢复/撤销/带宽变更/**管制窗口启用或解除**抢占（单笔/整组/暂停/恢复/带宽变更/窗口共享裁决） |
+| 409 | `stale_revision` | 修订号过期或被并发批准/暂停/恢复/撤销/带宽变更/**管制窗口启用或解除**/**换机交接**抢占（单笔/整组/暂停/恢复/带宽变更/窗口/交接共享裁决） |
 | 409 | `interference` | 重新裁决发现干扰，频段未占用（整组时 `details.applications[].conflicts` 用 `scope` 区分 `effective`/`group`）；或拟定带宽会使当前有效许可对互扰，带宽未变更（`details.interfering_pairs` 附许可对与触发条件）；或**恢复暂停许可时与当前有效许可互扰**，许可保持暂停（`details.conflicts` 附冲突对象，与单笔批准同构）。整组中同时存在普通干扰与窗口命中时也用本码，窗口命中另见各项 `restriction_window_conflicts` |
 | 409 | `restriction_window` | 写操作会让一个**命中生效管制窗口**的申请生效：单笔/整组批准或暂停恢复被阻止（`details.restriction_window_conflicts[]` 附命中窗口与三维触发标志，单笔另附 `conflicts[]` 保持结构兼容）；许可不生效、申请不离开原状态、不占修订号 |
 | 409 | `restriction_window_not_active` | 解除一个**已经解除**的管制窗口（`details.released_at_revision` 给出解除修订号；不占修订号） |
@@ -1258,6 +1351,118 @@ curl -s "http://localhost:8000/api/restriction-windows?include_inactive=true"
 #    "activated_at_revision": 2, "released_at_revision": 5, ...}]}
 ```
 
+### 6.19 换机交接：预演 → 确认（连续两修订号）→ 候补重裁 → 历史还原
+
+设保护带宽 **2 MHz**。许可 A `[100,110]` 已在修订号 **1** 获批；待审接替申请
+B `[105,108]`（与 A 频段相交——换机后正是接替 A 的设备）；另有待审申请
+D `[200,210]`、E `[202,209]` 已登记候补（E 与 D 相交）。
+
+**第 1 步：只读预演**——排除原许可 A 后裁决 B，返回当前修订号、干扰对象、
+命中窗口与候补位置：
+
+```bash
+curl -s -X POST http://localhost:8000/api/license-handovers/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"original_application_id": 1, "replacement_application_id": 2,
+       "expected_revision": 1, "reason": "设备换机"}'
+```
+
+```json
+{"original_application_id": 1, "replacement_application_id": 2,
+ "current_revision": 1, "expected_revision": 1, "revision_matches": true,
+ "can_proceed": true, "guard_band": 2.0,
+ "excluded_application_id": 1, "effective_application_ids": [],
+ "has_conflicts": false, "conflicts": [],
+ "has_restriction_window_conflicts": false, "restriction_window_conflicts": [],
+ "replacement_waitlisted": false, "replacement_queue_position": null}
+```
+
+预演**不改状态**：当前修订号仍是 1。若排除 A 后仍有干扰（例如另一条有效许可
+C `[107,109]`），预演 HTTP 仍为 200，但 `can_proceed` 为 `false` 并在
+`conflicts` 中给出 C；修订号不匹配时 `revision_matches` 为 `false`。原许可非有效
+/接替非待审/ID 未知/两者相同则分别返回 409 `not_effective`、409
+`replacement_not_pending`、404 `not_found`、422（`same_application`）。
+
+**第 2 步：携预期修订号确认**——撤销 A 占修订号 **2**，批准 B 占修订号 **3**；
+随后 FIFO 重裁：D 通过自动批准占修订号 **4**，E 与刚获批的 D 相交而保留候补：
+
+```bash
+curl -s -X POST http://localhost:8000/api/license-handovers \
+  -H 'Content-Type: application/json' \
+  -d '{"original_application_id": 1, "replacement_application_id": 2,
+       "expected_revision": 1, "reason": "设备换机"}'
+```
+
+```json
+{"handed_over": true, "handover_id": 1,
+ "original_application_id": 1, "replacement_application_id": 2,
+ "revision": 2, "revocation_revision": 2, "approval_revision": 3,
+ "final_revision": 4, "guard_band": 2.0, "reason": "设备换机",
+ "original": {"id": 1, "status": "revoked", ...},
+ "replacement": {"id": 2, "status": "approved", "approval_revision": 3, ...},
+ "approval": {"application_id": 2, "revision": 3, "guard_band": 2.0,
+              "handover_approved": true, "handover_id": 1,
+              "handover_revocation_revision": 2},
+ "auto_approved_application_ids": [4],
+ "auto_approvals": [{"application_id": 4, "revision": 4,
+                     "release_revision": 2, "guard_band": 2.0}],
+ "remaining_waitlist_application_ids": [5],
+ "waitlist_pending": [{"application_id": 5, "conflicts": [{"application": {"id": 4}, ...}]}]}
+```
+
+接替申请若本身在候补，确认时**先退队**（它不会在随后的 FIFO 重裁中被重复自动
+批准）；其批准事件 `auto_approved` 为 `false`、`release_revision` 为 `null`。
+
+**第 3 步：任何冲突都整笔不改**（许可、队列、修订号均不变）：
+
+```bash
+# 过期修订号
+curl -i -X POST http://localhost:8000/api/license-handovers \
+  -H 'Content-Type: application/json' \
+  -d '{"original_application_id": 1, "replacement_application_id": 2,
+       "expected_revision": 0}'
+# HTTP/1.1 409 {"error": {"code": "stale_revision",
+#   "details": {"expected_revision": 0, "current_revision": 1}}}
+
+# 原许可已撤销/暂停 -> 409 not_effective；接替申请已被处理 -> 409
+# replacement_not_pending；排除原许可后仍互扰 -> 409 interference
+# （details.conflicts 附冲突对象）；命中生效管制窗口 -> 409 restriction_window
+```
+
+**第 4 步：历史查询与对比按修订号还原交接状态**：
+
+```bash
+curl -s http://localhost:8000/api/revision/2
+# {"revision": 2, "effective_application_ids": [],
+#  "revocations": [{"revision": 2, "application_id": 1,
+#    "handover_id": 1, "handover_replacement_application_id": 2,
+#    "handover_approval_revision": 3, ...}],
+#  "handovers": [{"handover_id": 1, "revocation_revision": 2,
+#    "approval_revision": null, "complete": false, ...}], ...}
+
+curl -s http://localhost:8000/api/revision/3
+# {"revision": 3, "effective_application_ids": [2],
+#  "approvals": [..., {"revision": 3, "application_id": 2,
+#    "handover_approved": true, "handover_id": 1,
+#    "handover_original_application_id": 1,
+#    "handover_revocation_revision": 2, "auto_approved": false, ...}],
+#  "handovers": [{"revocation_revision": 2, "approval_revision": 3,
+#    "final_revision": 4, "complete": true, ...}]}
+
+curl -s "http://localhost:8000/api/revision/compare?base_revision=1&target_revision=4"
+# {"effective_application_ids": {"base": [1], "target": [2, 4],
+#    "added": [2, 4], "removed": [1]},
+#  "handovers": [{"type": "license_handover", "revision": 2,
+#    "original_application_id": 1, "replacement_application_id": 2, ...}],
+#  "status_changes": [
+#    {"revision": 2, "application_id": 1, "from_status": "approved", "to_status": "revoked"},
+#    {"revision": 3, "application_id": 2, "from_status": "pending",  "to_status": "approved"},
+#    {"revision": 4, "application_id": 4, "from_status": "pending",  "to_status": "approved"}], ...}
+```
+
+普通撤销/批准记录不带任何交接字段；既有撤销、批准、暂停/恢复、带宽变更、管制窗口
+与候补语义保持不变。
+
 ---
 
 ## 7. 项目结构
@@ -1265,15 +1470,15 @@ curl -s "http://localhost:8000/api/restriction-windows?include_inactive=true"
 ```
 .
 ├── app/
-│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准、暂停/恢复、带宽在线配置、可用位置查询、候补队列/释放自动重裁与临时管制窗口预演/启用/解除）
+│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准、暂停/恢复、带宽在线配置、可用位置查询、候补队列/释放自动重裁、临时管制窗口预演/启用/解除与换机许可交接预演/确认）
 │   ├── adjudication.py         # 纯函数：圆/时段/频段/保护带宽裁决、管制窗口命中判定（含组内两两、有效集成对检查、含窗口闭禁区的可用下界区间求解）
 │   ├── semantic_validation.py  # 整笔拒收的跨字段语义校验（含拟定带宽、候选下界区间与管制窗口形状/过期校验）
-│   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest、Suspension/ResumptionRequest、GuardBand*Request、AvailableRangesRequest、WaitlistRegistrationRequest、RestrictionWindow*Request）
-│   ├── models.py               # SQLAlchemy 表（申请 + 批准/暂停/恢复/撤销/带宽/管制窗口事件 + 生效管制窗口 + 候补队列 + 修订号/当前带宽）
+│   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest、Suspension/ResumptionRequest、GuardBand*Request、AvailableRangesRequest、WaitlistRegistrationRequest、RestrictionWindow*Request、LicenseHandoverRequest）
+│   ├── models.py               # SQLAlchemy 表（申请 + 批准/暂停/恢复/撤销/带宽/管制窗口/换机交接事件 + 生效管制窗口 + 候补队列 + 修订号/当前带宽）
 │   ├── db.py                   # 引擎、等待数据库、建表与旧库列升级、修订号与带宽初值初始化（重启不覆盖）
 │   ├── config.py               # 环境变量配置（GUARD_BAND 仅作建库初值）
 │   └── errors.py               # 统一错误信封
-├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite，含 test_waitlist.py 候补用例、test_restriction_windows*.py 管制窗口用例）
+├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite，含 test_waitlist.py 候补用例、test_restriction_windows*.py 管制窗口用例、test_handovers.py 换机交接用例）
 ├── examples/walkthrough.sh     # curl 走查脚本
 ├── Dockerfile
 ├── docker-compose.yml          # db + api 一键启动

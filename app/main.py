@@ -24,6 +24,10 @@ POST   /api/restriction-windows/{id}/release
                                          lift a window (expected revision)
 GET    /api/restriction-windows          list active (+ released) windows
 GET    /api/restriction-windows/{id}     one window (active or released)
+POST   /api/license-handovers/preview    rehearse a device-replacement handover
+POST   /api/license-handovers            hand one effective license to a
+                                         pending replacement (expected rev.;
+                                         revoke+approve on consecutive revs)
 GET    /api/revision/current             current revision + effective set
 GET    /api/revision/{revision}          as-of snapshot (all event types)
 GET    /api/revision/compare             compare two as-of revision snapshots
@@ -101,6 +105,25 @@ only affects later adjudication (it never auto-approves the waitlist).
 Activations and releases are immutable events, so revision snapshots and
 comparisons restore the windows active at the time; original approval
 events are never rewritten.
+
+License handovers
+-----------------
+When an active device is replaced, the operator hands one currently
+effective license over to a pending replacement application.  A read-only
+rehearsal (preview) returns the current revision, the effective set with
+the original license excluded, the remaining interference objects and the
+hit restriction windows; the confirmation carries the expected revision
+and re-adjudicates under the shared lock.  The handover only takes effect
+when the original is still effective, the replacement is still pending,
+the revision is current and the replacement (judged without the original)
+has no interference and hits no window; then the original's revocation and
+the replacement's approval occupy two consecutive revisions (revocation
+first), a waitlisted replacement leaves the queue first, and the FIFO
+waitlist is afterwards re-adjudicated by the existing release rules.  A
+stale revision, a changed status or any conflict changes nothing: no
+license, queue entry or revision is touched.  Each handover is an
+immutable ``handover_events`` row linking its revocation and approval, so
+revision snapshots and comparisons restore every revision's state.
 """
 from __future__ import annotations
 
@@ -123,6 +146,7 @@ from .models import (
     Application,
     ApprovalEvent,
     GuardBandEvent,
+    HandoverEvent,
     ResumptionEvent,
     RestrictionWindow as RestrictionWindowRow,
     RestrictionWindowEvent,
@@ -138,6 +162,7 @@ from .schemas import (
     BatchApprovalRequest,
     GuardBandPreviewRequest,
     GuardBandUpdateRequest,
+    LicenseHandoverRequest,
     ResumptionRequest,
     RestrictionWindowConfirmRequest,
     RestrictionWindowReleaseRequest,
@@ -174,6 +199,12 @@ E_NOT_WAITLISTED = "not_waitlisted"
 E_RESTRICTION_WINDOW = "restriction_window"
 E_WINDOW_NOT_FOUND = "restriction_window_not_found"
 E_WINDOW_NOT_ACTIVE = "restriction_window_not_active"
+# A handover source is no longer an effective license, or its replacement is
+# no longer pending (HTTP 409; nothing is changed and no revision consumed).
+E_NOT_EFFECTIVE = "not_effective"
+E_REPLACEMENT_NOT_PENDING = "replacement_not_pending"
+# The handover pairs an application with itself.
+E_SAME_APPLICATION = "same_application"
 
 
 # --------------------------------------------------------------------------- #
@@ -593,6 +624,23 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         .order_by(RestrictionWindowEvent.revision)
         .all()
     )
+    handover_events = (
+        session.query(HandoverEvent)
+        .filter(HandoverEvent.revocation_revision <= revision)
+        .order_by(HandoverEvent.revocation_revision)
+        .all()
+    )
+
+    # Device-replacement handovers link an ordinary revocation (the original
+    # license) with the replacement's approval on the next revision.  Index
+    # both revisions so the existing approval/revocation records can point
+    # back at the handover they belong to.
+    handover_by_revocation = {
+        ev.revocation_revision: ev for ev in handover_events
+    }
+    handover_by_approval = {
+        ev.approval_revision: ev for ev in handover_events
+    }
 
     # Replay every lifecycle event up to the target revision in revision
     # order; the last event of each application decides its as-of state.
@@ -643,6 +691,17 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
             "status_as_of": status_as_of,
             "application": serialize_application(app) if app else None,
         }
+        handover = handover_by_approval.get(ev.revision)
+        if handover is not None:
+            # The replacement approval of a device-replacement handover.
+            record["handover_id"] = handover.id
+            record["handover_approved"] = True
+            record["handover_original_application_id"] = (
+                handover.original_application_id
+            )
+            record["handover_revocation_revision"] = (
+                handover.revocation_revision
+            )
         if status_as_of == "revoked":
             record["revoked_at_revision"] = marker
         elif status_as_of == "suspended":
@@ -658,6 +717,21 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
             "application_id": ev.application_id,
             "reason": ev.reason,
             "created_at": iso(ev.created_at),
+            # When this revocation is the first half of a handover, point at
+            # the replacement approval on the next revision.
+            **(
+                {
+                    "handover_id": handover_by_revocation[ev.revision].id,
+                    "handover_replacement_application_id": handover_by_revocation[
+                        ev.revision
+                    ].replacement_application_id,
+                    "handover_approval_revision": handover_by_revocation[
+                        ev.revision
+                    ].approval_revision,
+                }
+                if ev.revision in handover_by_revocation
+                else {}
+            ),
         }
         for ev in revocations
     ]
@@ -723,6 +797,29 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         for wid in sorted(active_windows)
     ]
 
+    handover_records: list[dict[str, Any]] = []
+    for ev in handover_events:
+        # The approval half lands on revocation_revision + 1; until the
+        # queried revision reaches it the handover is visible only as the
+        # revocation (in practice the two revisions commit together).
+        complete = ev.approval_revision <= revision
+        record = {
+            "handover_id": ev.id,
+            "revision": ev.revocation_revision,
+            "original_application_id": ev.original_application_id,
+            "replacement_application_id": ev.replacement_application_id,
+            "revocation_revision": ev.revocation_revision,
+            "approval_revision": ev.approval_revision
+            if complete
+            else None,
+            "final_revision": min(ev.final_revision, revision),
+            "guard_band": ev.guard_band,
+            "reason": ev.reason,
+            "created_at": iso(ev.created_at),
+            "complete": complete,
+        }
+        handover_records.append(record)
+
     return {
         "revision": revision,
         "guard_band": guard_band_at(session, revision),
@@ -740,6 +837,7 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         "active_restriction_window_ids": sorted(active_windows),
         "active_restriction_windows": active_window_records,
         "restriction_window_events": window_records,
+        "handovers": handover_records,
         "approvals": approval_records,
         "suspensions": suspension_records,
         "resumptions": resumption_records,
@@ -865,6 +963,17 @@ def build_revision_comparison(
         restriction_window_events.append(record)
         events.append(record)
 
+    handovers: list[dict[str, Any]] = []
+    for handover in newer["handovers"]:
+        if handover["revocation_revision"] <= older_revision:
+            continue
+        record = dict(handover)
+        record["type"] = "license_handover"
+        handovers.append(record)
+        # The handover headline rides its revocation revision in the unified
+        # event stream; the linked approval is already an "approval" event.
+        events.append(record)
+
     events.sort(key=lambda event: event["revision"])
 
     interval_statuses = _snapshot_status_map(older)
@@ -980,6 +1089,7 @@ def build_revision_comparison(
         "revocations": revocations,
         "guard_band_changes": guard_band_changes,
         "restriction_window_events": restriction_window_events,
+        "handovers": handovers,
         "differences": events,
         "events": events,
     }
@@ -1086,6 +1196,7 @@ def current_revision() -> dict[str, Any]:
             serialize_window_row(row) for row in active_window_rows
         ],
         "restriction_window_events": snapshot["restriction_window_events"],
+        "handovers": snapshot["handovers"],
         "waitlist_application_ids": [e["application_id"] for e in waitlist_entries],
         "waitlist_entries": waitlist_entries,
         "approvals": snapshot["approvals"],
@@ -2730,6 +2841,363 @@ def get_restriction_window(window_id: int) -> dict[str, Any]:
             body["released_at_revision"] = release.revision
             body["release_reason"] = release.reason
         return {"window": body}
+
+
+# --------------------------------------------------------------------------- #
+# License handover (device replacement: revoke one effective license and
+# approve a pending replacement atomically on two consecutive revisions)
+# --------------------------------------------------------------------------- #
+def _handover_rehearsal(
+    session,
+    payload: LicenseHandoverRequest,
+    *,
+    strict: bool,
+) -> dict[str, Any]:
+    """Shared rehearsal computation for a license handover.
+
+    Loads the original license and the replacement application, verifies
+    their states, and re-adjudicates the replacement against the live
+    effective set **with the original license excluded** (the current guard
+    band) and against every active restriction window.
+
+    When ``strict`` is false (the read-only preview) a stale expected
+    revision, interference and restriction-window hits are *reported* in the
+    body (``revision_matches``/``can_proceed`` plus the conflict and
+    window-hit lists) instead of raised; unknown ids, a self-handover and
+    wrong application states are still rejected, exactly like the ordinary
+    application preview.  When ``strict`` is true (the confirmation path)
+    every blocker raises the typed 409 error the confirmation contract
+    requires.  This function never mutates state.
+    """
+    meta = session.get(RevisionMeta, 1)
+    current = meta.revision
+    guard_band = meta.guard_band
+
+    rows = (
+        session.query(Application)
+        .filter(
+            Application.id.in_(
+                [
+                    payload.original_application_id,
+                    payload.replacement_application_id,
+                ]
+            )
+        )
+        .all()
+    )
+    rows_by_id = {row.id: row for row in rows}
+    missing = [
+        app_id
+        for app_id in (
+            payload.original_application_id,
+            payload.replacement_application_id,
+        )
+        if app_id not in rows_by_id
+    ]
+    if missing:
+        raise APIError(
+            E_NOT_FOUND,
+            f"application(s) {missing} do not exist; the handover was rejected",
+            status_code=404,
+            details={
+                "missing_application_ids": missing,
+                "current_revision": current,
+            },
+        )
+
+    if payload.original_application_id == payload.replacement_application_id:
+        raise APIError(
+            E_VALIDATION,
+            "the original and replacement applications must be different",
+            status_code=422,
+            details=[
+                {
+                    "field": "replacement_application_id",
+                    "code": E_SAME_APPLICATION,
+                    "message": (
+                        "replacement_application_id must differ from "
+                        "original_application_id"
+                    ),
+                }
+            ],
+        )
+
+    original = rows_by_id[payload.original_application_id]
+    replacement = rows_by_id[payload.replacement_application_id]
+
+    # The source must be a currently *effective* license: approved and
+    # neither suspended nor revoked.
+    if original.status != "approved":
+        raise APIError(
+            E_NOT_EFFECTIVE,
+            f"application {original.id} is {original.status}; only a currently "
+            "effective license can be handed over",
+            status_code=409,
+            details={
+                "application_id": original.id,
+                "status": original.status,
+                "approval_revision": original.approval_revision,
+                "current_revision": current,
+            },
+        )
+    if replacement.status != "pending":
+        raise APIError(
+            E_REPLACEMENT_NOT_PENDING,
+            f"application {replacement.id} is {replacement.status}; only a "
+            "pending application can receive a handed-over license",
+            status_code=409,
+            details={
+                "application_id": replacement.id,
+                "status": replacement.status,
+                "approval_revision": replacement.approval_revision,
+                "current_revision": current,
+            },
+        )
+
+    revision_matches = payload.expected_revision == current
+    if strict and not revision_matches:
+        raise APIError(
+            E_STALE_REVISION,
+            f"expected revision {payload.expected_revision} but current revision "
+            f"is {current}; re-preview and re-decide; the handover was not applied",
+            status_code=409,
+            details={
+                "expected_revision": payload.expected_revision,
+                "current_revision": current,
+            },
+        )
+
+    # Re-adjudicate against the effective set *minus the original license*:
+    # the handover removes the original before the replacement takes its
+    # place, so the two never need to be compatible with each other.
+    effective_without_original = [
+        lic
+        for lic in load_effective_licenses(session)
+        if lic.application_id != original.id
+    ]
+    candidate = to_license(replacement)
+    conflicts = adjudication.evaluate(
+        candidate, effective_without_original, guard_band
+    )
+    window_rows = load_active_windows(session)
+    window_hits = window_hits_for(candidate, window_rows)
+
+    if strict and window_hits:
+        raise APIError(
+            E_RESTRICTION_WINDOW,
+            f"replacement application {replacement.id} hits "
+            f"{len(window_hits)} active restriction window(s); the handover "
+            "was not applied",
+            status_code=409,
+            details={
+                "current_revision": current,
+                "restriction_window_conflicts": [
+                    serialize_window_hit(h) for h in window_hits
+                ],
+                "conflicts": [
+                    serialize_conflict(c, guard_band) for c in conflicts
+                ],
+            },
+        )
+    if strict and conflicts:
+        raise APIError(
+            E_INTERFERENCE,
+            f"replacement application {replacement.id} interferes with "
+            f"{len(conflicts)} effective grant(s) after the original license "
+            "is excluded; the handover was not applied",
+            status_code=409,
+            details={
+                "current_revision": current,
+                "conflicts": [
+                    serialize_conflict(c, guard_band) for c in conflicts
+                ],
+            },
+        )
+
+    waitlist_entry = (
+        session.query(WaitlistEntry)
+        .filter(WaitlistEntry.application_id == replacement.id)
+        .one_or_none()
+    )
+    queue_position = None
+    if waitlist_entry is not None:
+        queue_position = load_waitlist(session).index(waitlist_entry) + 1
+
+    conflict_bodies = [serialize_conflict(c, guard_band) for c in conflicts]
+    window_bodies = [serialize_window_hit(h) for h in window_hits]
+    return {
+        "original_application_id": original.id,
+        "replacement_application_id": replacement.id,
+        "expected_revision": payload.expected_revision,
+        "current_revision": current,
+        "guard_band": guard_band,
+        "revision_matches": revision_matches,
+        "can_proceed": revision_matches and not conflicts and not window_hits,
+        "original": serialize_application(original),
+        "replacement": serialize_application(replacement),
+        "replacement_waitlisted": waitlist_entry is not None,
+        "replacement_queue_position": queue_position,
+        # Effective set the replacement is actually judged against.
+        "effective_application_ids": [
+            lic.application_id for lic in effective_without_original
+        ],
+        "excluded_application_id": original.id,
+        "has_conflicts": bool(conflicts),
+        "conflicts": conflict_bodies,
+        "has_restriction_window_conflicts": bool(window_hits),
+        "restriction_window_conflicts": window_bodies,
+        "active_restriction_window_ids": [row.id for row in window_rows],
+        "reason": payload.reason,
+    }
+
+
+@app.post("/api/license-handovers/preview", tags=["license-handovers"])
+def preview_license_handover(payload: LicenseHandoverRequest) -> dict[str, Any]:
+    """Rehearse a device-replacement license handover without changing state.
+
+    Returns the current revision, the effective set with the original
+    license excluded under the live guard band, the remaining interference
+    objects and the hit active restriction windows, plus whether the
+    replacement is currently waitlisted (and its queue position).  Blockers
+    are reported in the body (``can_proceed``, ``revision_matches``,
+    ``conflicts``, ``restriction_window_conflicts``); unknown ids, a
+    self-handover and wrong application states are still rejected.  The
+    rehearsal consumes no revision and changes nothing.
+    """
+    with SessionLocal() as session:
+        return _handover_rehearsal(session, payload, strict=False)
+
+
+@app.post("/api/license-handovers", tags=["license-handovers"])
+def confirm_license_handover(payload: LicenseHandoverRequest) -> dict[str, Any]:
+    """Confirm a rehearsed license handover (device replacement).
+
+    Shares the singleton revision lock with every other writer and
+    re-adjudicates inside the lock: it only takes effect when the original
+    license is still effective, the replacement is still pending, the
+    expected revision is current, and excluding the original license the
+    replacement has no interference and hits no active restriction window.
+    On success the original's revocation and the replacement's approval
+    occupy two consecutive revisions (revocation first, then approval), a
+    waitlisted replacement leaves the queue first, and the FIFO waitlist is
+    afterwards re-adjudicated by the existing release rules (each further
+    automatic approval consuming the next consecutive revision).  A stale
+    revision, a changed status or any conflict aborts the whole operation:
+    licenses, queue and revisions are all left untouched.
+    """
+    with SessionLocal() as session:
+        try:
+            with session.begin():
+                # Same singleton lock as every other writer: one revision
+                # arbitration for the revocation, the approval and the
+                # following waitlist drain.
+                session.get(RevisionMeta, 1, with_for_update=True)
+                rehearsal = _handover_rehearsal(session, payload, strict=True)
+                current = rehearsal["current_revision"]
+                guard_band = rehearsal["guard_band"]
+                original = session.get(
+                    Application, payload.original_application_id
+                )
+                replacement = session.get(
+                    Application, payload.replacement_application_id
+                )
+
+                # Step 1: revoke the original license (first revision).
+                meta = session.get(RevisionMeta, 1)
+                meta.revision = current + 1
+                revocation_revision = meta.revision
+                session.add(
+                    RevocationEvent(
+                        revision=revocation_revision,
+                        application_id=original.id,
+                        reason=payload.reason,
+                    )
+                )
+                original.status = "revoked"
+
+                # Step 2: approve the replacement (the consecutive revision).
+                # A waitlisted replacement leaves the queue before the
+                # later drain, exactly like a manual approval.
+                entry = (
+                    session.query(WaitlistEntry)
+                    .filter(
+                        WaitlistEntry.application_id == replacement.id
+                    )
+                    .one_or_none()
+                )
+                if entry is not None:
+                    session.delete(entry)
+
+                meta.revision += 1
+                approval_revision = meta.revision
+                session.add(
+                    ApprovalEvent(
+                        revision=approval_revision,
+                        application_id=replacement.id,
+                        guard_band=guard_band,
+                    )
+                )
+                replacement.status = "approved"
+                replacement.approval_revision = approval_revision
+
+                handover = HandoverEvent(
+                    original_application_id=original.id,
+                    replacement_application_id=replacement.id,
+                    revocation_revision=revocation_revision,
+                    approval_revision=approval_revision,
+                    final_revision=approval_revision,
+                    guard_band=guard_band,
+                    reason=payload.reason,
+                )
+                session.add(handover)
+                session.flush()  # assign the handover id
+
+                # Step 3: re-adjudicate the remaining FIFO waitlist with the
+                # existing release rules in this same transaction/sequence.
+                waitlist_result = drain_waitlist(
+                    session, meta, revocation_revision
+                )
+                handover.final_revision = meta.revision
+
+                session.flush()
+                response = {
+                    "handed_over": True,
+                    "original_application_id": original.id,
+                    "replacement_application_id": replacement.id,
+                    "handover_id": handover.id,
+                    # The revocation's own revision and the consecutive
+                    # approval revision.
+                    "revision": revocation_revision,
+                    "revocation_revision": revocation_revision,
+                    "approval_revision": approval_revision,
+                    "final_revision": meta.revision,
+                    "guard_band": guard_band,
+                    "reason": payload.reason,
+                    "original": serialize_application(original),
+                    "replacement": serialize_application(replacement),
+                    "approval": {
+                        "application_id": replacement.id,
+                        "revision": approval_revision,
+                        "guard_band": guard_band,
+                        "handover_approved": True,
+                        "handover_id": handover.id,
+                        "handover_revocation_revision": revocation_revision,
+                    },
+                    **waitlist_result,
+                }
+        except IntegrityError:
+            # Backends without row locks (SQLite in tests): a concurrent
+            # writer took a revision slot; the whole handover is rolled back.
+            session.rollback()
+            latest = session.get(RevisionMeta, 1).revision
+            raise APIError(
+                E_STALE_REVISION,
+                f"the revision advanced concurrently (now {latest}); "
+                "re-preview and re-decide; the handover was not applied",
+                status_code=409,
+                details={"current_revision": latest},
+            )
+    return response
 
 
 # --------------------------------------------------------------------------- #

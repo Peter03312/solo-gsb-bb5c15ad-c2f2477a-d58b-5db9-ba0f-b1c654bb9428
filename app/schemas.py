@@ -143,3 +143,18 @@ class RestrictionWindowReleaseRequest(BaseModel):
     # auto-approved.  Consumes exactly one revision.
     expected_revision: int = Field(ge=0)
     reason: str = Field(default="", max_length=2000)
+
+
+class LicenseHandoverRequest(BaseModel):
+    # Device-replacement handover: hand the license of one currently
+    # effective application over to a pending replacement application.
+    # Used by both the read-only rehearsal preview and the confirming
+    # request: the preview ignores/reports the expected revision while the
+    # confirmation shares the revision arbitration with every other writer.
+    # On success the original's revocation and the replacement's approval
+    # occupy two consecutive revisions (revocation first), after which the
+    # FIFO waitlist is re-adjudicated under the existing rules.
+    original_application_id: int = Field(ge=1)
+    replacement_application_id: int = Field(ge=1)
+    expected_revision: int = Field(ge=0)
+    reason: str = Field(default="", max_length=2000)

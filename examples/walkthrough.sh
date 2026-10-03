@@ -314,3 +314,75 @@ curl -s "$BASE/api/restriction-windows?include_inactive=true" | python3 -c 'impo
 echo "    release did not auto-approve K; it is still queued and pending:"
 curl -s "$BASE/api/waitlist" | python3 -c 'import json,sys; print("queue:", json.load(sys.stdin)["waitlist_application_ids"])'
 post "/api/applications/$K_ID/approve" "{\"expected_revision\":$REL_REV}" | python3 -c 'import json,sys; print("after release, approving K now succeeds at revision", json.load(sys.stdin)["revision"])'
+
+echo "== 44. device-replacement handover: rehearsal preview (read-only) =="
+echo "    scene on a fresh future day 2031-10-01 08:00-12:00:"
+echo "    effective license HA [100,110]; pending replacement HB [105,108] (overlaps HA);"
+echo "    standbys HD [200,210] (clean) and HE [202,209] (clashes with HD)"
+mk2031() { post /api/applications "{
+  \"name\":\"$1\",
+  \"circle\":{\"cx\":0,\"cy\":0,\"radius\":1000},
+  \"frequency\":{\"low\":$2,\"high\":$3},
+  \"time_window\":{\"start\":\"2031-10-01T08:00:00Z\",\"end\":\"2031-10-01T12:00:00Z\"}
+}"; }
+HA=$(mk2031 "Handover A" 100 110); HA_ID=$(echo "$HA" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+HB=$(mk2031 "Handover B" 105 108); HB_ID=$(echo "$HB" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+HD=$(mk2031 "Handover D" 200 210); HD_ID=$(echo "$HD" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+HE=$(mk2031 "Handover E" 202 209); HE_ID=$(echo "$HE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post "/api/applications/$HA_ID/approve" "{\"expected_revision\":$REV}" | python3 -c 'import json,sys; print("HA approved at revision", json.load(sys.stdin)["revision"])'
+post "/api/applications/$HD_ID/waitlist" '{}' >/dev/null
+post "/api/applications/$HE_ID/waitlist" '{}' >/dev/null
+REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post /api/license-handovers/preview "{
+  \"original_application_id\":$HA_ID,
+  \"replacement_application_id\":$HB_ID,
+  \"expected_revision\":$REV,
+  \"reason\":\"device replacement\"}" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("can_proceed:", d["can_proceed"], "revision_matches:", d["revision_matches"])
+print("excluded:", d["excluded_application_id"], "judged effective:", d["effective_application_ids"])
+print("conflicts:", d["has_conflicts"], "window hits:", d["has_restriction_window_conflicts"], "waitlisted:", d["replacement_waitlisted"])'
+echo "    stale expectation is reported (not raised) in the read-only rehearsal:"
+post /api/license-handovers/preview "{
+  \"original_application_id\":$HA_ID,
+  \"replacement_application_id\":$HB_ID,
+  \"expected_revision\":0}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("revision_matches:", d["revision_matches"], "can_proceed:", d["can_proceed"], "; revision still", d["current_revision"])'
+echo "    self-handover and unknown ids are rejected:"
+post /api/license-handovers/preview "{\"original_application_id\":$HA_ID,\"replacement_application_id\":$HA_ID,\"expected_revision\":$REV}" | python3 -c 'import json,sys; print([x["code"] for x in json.load(sys.stdin)["error"]["details"]])'
+
+echo "== 45. confirm: revoke HA and approve HB on consecutive revisions, then FIFO drain =="
+post /api/license-handovers "{
+  \"original_application_id\":$HA_ID,
+  \"replacement_application_id\":$HB_ID,
+  \"expected_revision\":$REV,
+  \"reason\":\"device replacement\"}" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("handed_over:", d["handed_over"], "handover_id:", d["handover_id"])
+print("revocation:", d["revocation_revision"], "approval:", d["approval_revision"], "final:", d["final_revision"])
+print("original status:", d["original"]["status"], "; replacement status:", d["replacement"]["status"])
+print("auto approved:", d["auto_approved_application_ids"], "; kept waiting:", d["remaining_waitlist_application_ids"])
+print("HB approval flags:", {k: d["approval"][k] for k in ("handover_approved","handover_revocation_revision")})'
+echo "    a repeated confirm is refused (original no longer effective), nothing changes:"
+post /api/license-handovers "{\"original_application_id\":$HA_ID,\"replacement_application_id\":$HB_ID,\"expected_revision\":$((REV+3))}" | python3 -c 'import json,sys; print("repeat ->", json.load(sys.stdin)["error"]["code"])'
+
+echo "== 46. history restores each handover revision; ordinary events keep no handover fields =="
+curl -s "$BASE/api/revision/$((REV+1))" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("rev", d["revision"], "effective:", d["effective_application_ids"])
+print("revocation link:", [(r["application_id"], r.get("handover_replacement_application_id"), r.get("handover_approval_revision")) for r in d["revocations"]])
+print("handover complete:", [(h["revocation_revision"], h["approval_revision"], h["complete"]) for h in d["handovers"]])'
+curl -s "$BASE/api/revision/$((REV+2))" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("rev", d["revision"], "effective:", d["effective_application_ids"])
+hb=[a for a in d["approvals"] if a.get("handover_approved")][0]
+print("HB handover approval:", hb["application_id"], hb["handover_revocation_revision"], "auto:", hb["auto_approved"])'
+curl -s "$BASE/api/revision/compare?base_revision=$REV&target_revision=$((REV+3))" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("compare handovers:", [(h["type"], h["original_application_id"], h["replacement_application_id"]) for h in d["handovers"]])
+print("status changes:", [(c["application_id"], c["from_status"], c["to_status"]) for c in d["status_changes"]])'

@@ -30,6 +30,11 @@ History is event-sourced:
 * ``restriction_window_events`` - append-only activation/release records for
                            restriction windows, one per revision, so snapshots
                            reconstruct the windows active at any revision;
+* ``handover_events``    - append-only device-replacement handover records; a
+                           handover atomically revokes the original license
+                           and approves the replacement application on two
+                           consecutive revisions (the revocation first), and
+                           then re-adjudicates the FIFO waitlist;
 * ``revision_meta``      - singleton row holding the current revision number
                            and the guard band currently in force.
 
@@ -332,6 +337,66 @@ class WaitlistEntry(Base):
     reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
+class HandoverEvent(Base):
+    """Append-only record of a device-replacement license handover.
+
+    When an active device is replaced, the operator hands one currently
+    effective license over to a pending replacement application.  The
+    decision is atomic under the shared revision arbitration: inside one
+    transaction the original license is revoked (consuming
+    ``revocation_revision``) and the replacement application is approved on
+    the immediately following revision (``approval_revision``); afterwards
+    the FIFO waitlist is re-adjudicated by the existing release rules, with
+    every further automatic approval consuming the next consecutive
+    revision.
+
+    The replacement must be free of interference (under the live guard
+    band, with the original license excluded from the effective set) and
+    must not hit an active restriction window; a waitlisted replacement
+    leaves the queue first, exactly like a manual approval.  A stale
+    revision, a changed status or any conflict aborts the whole operation:
+    no license, queue entry or revision is touched.
+
+    The revocation and approval stay ordinary events in their own streams
+    (existing revoke/approve semantics are preserved); this row links them
+    so revision snapshots and comparisons can restore every revision's
+    handover state, including the reason and the final revision after the
+    waitlist drain.
+    """
+
+    __tablename__ = "handover_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    original_application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    replacement_application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    # The original license's revocation: the first of the two consecutive
+    # revisions the handover occupies.
+    revocation_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, unique=True
+    )
+    # The replacement's approval: revocation_revision + 1.
+    approval_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, unique=True
+    )
+    # Revision after the handover and its waitlist drain finished.
+    final_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Guard band snapshot used when adjudicating the replacement.
+    guard_band: Mapped[float] = mapped_column(Float, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_handover_events_original", "original_application_id"),
+        Index("ix_handover_events_replacement", "replacement_application_id"),
     )
 
 
