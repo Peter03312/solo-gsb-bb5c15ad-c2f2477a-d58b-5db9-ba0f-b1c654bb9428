@@ -84,13 +84,19 @@ class TestRevisionComparison:
 
         assert body["direction"] == "forward"
         assert body["guard_band"] == {"base": 2.0, "target": 1.0, "changed": True}
-        assert body["effective_application_ids"] == {
+        assert {
+            k: body["effective_application_ids"][k]
+            for k in ("base", "target", "added", "removed")
+        } == {
             "base": [a],
             "target": [standby],
             "added": [standby],
             "removed": [a],
         }
-        assert body["suspended_application_ids"] == {
+        assert {
+            k: body["suspended_application_ids"][k]
+            for k in ("base", "target", "added", "removed")
+        } == {
             "base": [],
             "target": [a],
             "added": [a],
@@ -199,7 +205,10 @@ class TestRevisionComparison:
         body = compare(client, 1, 1)
         assert body["differences"] == []
         assert body["status_changes"] == []
-        assert body["effective_application_ids"] == {
+        assert {
+            k: body["effective_application_ids"][k]
+            for k in ("base", "target", "added", "removed")
+        } == {
             "base": [a],
             "target": [a],
             "added": [],

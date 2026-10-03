@@ -143,3 +143,32 @@ class RestrictionWindowReleaseRequest(BaseModel):
     # auto-approved.  Consumes exactly one revision.
     expected_revision: int = Field(ge=0)
     reason: str = Field(default="", max_length=2000)
+
+
+class LicenseTransferRequest(BaseModel):
+    """Hand over one effective license to a pending application (device swap).
+
+    Used by both the read-only rehearsal preview and the confirming call.
+    ``source_application_id`` is the currently effective license to revoke;
+    ``successor_application_id`` is the still-pending application that
+    replaces it.  The preview needs no revision; the confirm request adds the
+    mandatory ``expected_revision`` (see :class:`LicenseTransferConfirmRequest`).
+    """
+
+    source_application_id: int = Field(ge=1)
+    successor_application_id: int = Field(ge=1)
+    reason: str = Field(default="", max_length=2000)
+
+
+class LicenseTransferConfirmRequest(LicenseTransferRequest):
+    """Commit a rehearsed handover under the shared revision arbitration.
+
+    On success the source revocation and the successor approval consume two
+    consecutive revisions; a queued successor leaves the waitlist first and
+    the remaining standbys are re-adjudicated by the normal FIFO rules.  A
+    stale revision, a status change, renewed interference or a restriction
+    window hit rejects the whole transaction without touching licenses, the
+    queue or the revision.
+    """
+
+    expected_revision: int = Field(ge=0)

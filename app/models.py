@@ -16,6 +16,11 @@ History is event-sourced:
                            guard band snapshot the re-decision used);
 * ``revocation_events``  - append-only revocation record, one per revision
                            (a suspended license may be permanently revoked);
+* ``license_transfer_events`` - append-only equipment-change handover record,
+                           one per handover, keyed by the revocation revision;
+                           links the ordinary revocation of the source license
+                           and the ordinary (manual) approval of its pending
+                           successor, which keep two consecutive revisions;
 * ``guard_band_events``  - append-only guard-band record, one per revision
                            (revision 0 is the initial value seeded at database
                            creation, every later row is one confirmed online
@@ -148,6 +153,54 @@ class RevocationEvent(Base):
     )
 
     __table_args__ = (Index("ix_revocation_events_application", "application_id"),)
+
+
+class LicenseTransferEvent(Base):
+    """Append-only record of an equipment-change license handover.
+
+    A handover permanently revokes one currently effective license (the
+    active-device license being handed in) and approves one still-pending
+    application (the replacement device) as one atomic, conditional
+    transaction.  The source revocation and the successor approval are the
+    ordinary :class:`RevocationEvent` / :class:`ApprovalEvent` rows on two
+    consecutive revisions (existing revoke/approve semantics are kept); this
+    row only links them for audit.
+
+    ``revision`` is the revocation revision; ``successor_approval_revision``
+    is the next consecutive revision (both unique).  ``reason`` is the
+    operator reason given for the handover.  A successor that was queued as a
+    standby leaves the waitlist before its approval; afterwards the queue is
+    re-adjudicated by the normal FIFO rules, exactly like after an ordinary
+    revoke.  History snapshots replay this row alongside the ordinary
+    events, so every revision of a handover (and the auto approvals it may
+    trigger) reconstructs exactly as it was; original approval events are
+    never rewritten.
+    """
+
+    __tablename__ = "license_transfer_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # The handover's first revision: the source license revocation.
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    source_application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    successor_application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    # The handover's second revision: the successor's (manual) approval.
+    successor_approval_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, unique=True
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_license_transfer_events_source", "source_application_id"),
+        Index("ix_license_transfer_events_successor", "successor_application_id"),
+    )
 
 
 class SuspensionEvent(Base):

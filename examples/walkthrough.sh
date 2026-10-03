@@ -314,3 +314,36 @@ curl -s "$BASE/api/restriction-windows?include_inactive=true" | python3 -c 'impo
 echo "    release did not auto-approve K; it is still queued and pending:"
 curl -s "$BASE/api/waitlist" | python3 -c 'import json,sys; print("queue:", json.load(sys.stdin)["waitlist_application_ids"])'
 post "/api/applications/$K_ID/approve" "{\"expected_revision\":$REL_REV}" | python3 -c 'import json,sys; print("after release, approving K now succeeds at revision", json.load(sys.stdin)["revision"])'
+
+echo "== 44. active-device handover: preview (source excluded), confirm on consecutive revisions, FIFO re-adjudication =="
+mkx() { post /api/applications "{
+  \"name\":\"$1\",
+  \"circle\":{\"cx\":0,\"cy\":0,\"radius\":10},
+  \"frequency\":{\"low\":$2,\"high\":$3},
+  \"time_window\":{\"start\":\"2026-12-15T08:00:00Z\",\"end\":\"2026-12-15T12:00:00Z\"}
+}"; }
+S=$(mkx "source-license" 400 410); SRC_ID=$(echo "$S" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+X=$(mkx "successor" 400 402); X_ID=$(echo "$X" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+Y=$(mkx "standby-pass" 430 432); Y_ID=$(echo "$Y" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+Z=$(mkx "standby-blocked" 431 433); Z_ID=$(echo "$Z" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+TR_REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post "/api/applications/$SRC_ID/approve" "{\"expected_revision\":$TR_REV}" | python3 -c 'import json,sys; print("source approved at revision", json.load(sys.stdin)["revision"])'
+post "/api/applications/$X_ID/waitlist" '{"reason":"waiting for source"}' > /dev/null
+post "/api/applications/$Y_ID/waitlist" > /dev/null
+post "/api/applications/$Z_ID/waitlist" > /dev/null
+TR_REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+
+post /api/license-transfers/preview "{\"source_application_id\":$SRC_ID,\"successor_application_id\":$X_ID,\"reason\":\"device swap\"}" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("preview ready:", d["ready"], "; current:", d["current_revision"], "; effective excluding source:", d["effective_application_ids"], "; successor queue pos:", d["successor_waitlist_position"], "; planned revisions:", d["planned_revoc_revision"], d["planned_successor_revision"])'
+
+post /api/license-transfers "{\"source_application_id\":$SRC_ID,\"successor_application_id\":$X_ID,\"expected_revision\":$TR_REV,\"reason\":\"device swap\"}" \
+  | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print("transferred:", d["transferred"], "; revocation rev:", d["revocation_revision"], "; successor rev:", d["successor_approval_revision"], "; final:", d["final_revision"])
+print("successor was waitlisted:", d["successor_was_waitlisted"], "; manual approval:", (not d["approval"]["auto_approved"]))
+print("auto approved after handover:", d["auto_approved_application_ids"], "release_revision:", [a["release_revision"] for a in d["auto_approvals"]])
+print("still waiting:", d["remaining_waitlist_application_ids"])'
+
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("effective:", d["effective_application_ids"], "; waitlist:", d["waitlist_application_ids"], "; transfers:", [(t["revision"],t["source_application_id"],t["successor_application_id"],t["successor_approval_revision"]) for t in d["license_transfers"]])'
+SRC_REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print([t["revision"] for t in d["license_transfers"]][0])')
+curl -s "$BASE/api/revision/$SRC_REV" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("at revocation revision", d["revision"], "effective (source gone, successor not yet approved):", d["effective_application_ids"])'
